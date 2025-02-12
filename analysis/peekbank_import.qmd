@@ -1,0 +1,523 @@
+---
+title: "Peekbank image availability initial scan"
+author: "Tarun Sepuri"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+# Download peekbankr
+
+If you haven't downloaded peekbankr (https://github.com/langcog/peekbankr) yet, be sure to do so first by uncommenting the lines below.
+
+```{r}
+knitr::opts_chunk$set(cache = FALSE, arn = FALSE,warning=FALSE, message = FALSE,cache.lazy = FALSE)
+
+install.packages("remotes") # can also use devtools
+remotes::install_github("langcog/peekbankr", force=TRUE)
+```
+
+# Preliminaries and data loading
+
+Load packages. Since it takes a while to download and join the data, you probably want to just do that once, and then save the resulting dataset. Setting the parameter FIRST_TIME to FALSE after you run the script the first time allows you to bypass the data download process on subsequent runs. You can also use the most recent data file uploaded to GitHub.
+
+```{r}
+FIRST_TIME = TRUE # set to true first time to download data from DB
+
+library(peekbankr)
+library(tidyverse)
+library(here)
+library(RColorBrewer)
+
+#library(cowplot)
+#theme_set(theme_cowplot())
+```
+
+```{r, eval = FIRST_TIME}
+conn <-connect_to_peekbank("2025.1")
+
+#get all of the tables you need
+datasets <- get_datasets(connection = conn) |> dplyr::collect()
+
+ # ds.get_raw_data("frank_tablet_2016", "kartushina_2021")
+administrations <- get_administrations(connection = conn) |> dplyr::collect()
+subjects <- get_subjects(connection = conn) |> dplyr::collect()
+aoi_timepoints <- get_aoi_timepoints(rle=FALSE, connection = conn) |> dplyr::collect()
+stimuli <- get_stimuli() |> dplyr::collect()
+trial_types <- get_trial_types(connection = conn) |> dplyr::collect()
+trials <- get_trials(connection = conn) |> dplyr::collect()
+```
+
+Helpers for stimuli download
+```{r}
+# Function to find the common prefix in a vector of strings: using this to find the subdirectory that contains the image stimuli set, assuming all images are stored in or around the same subdirectory
+find_common_prefix <- function(strings) {
+  if (length(strings) == 0) return("")
+  
+  # Split the strings into individual characters
+  split_strings <- strsplit(strings, "")
+  
+  # Start with the first string as the base for comparison
+  common_chars <- split_strings[[1]]
+  
+  # Loop through the remaining strings
+  for (string in split_strings[-1]) {
+    common_chars <- common_chars[1:min(length(common_chars), length(string))]
+    common_chars <- common_chars[common_chars == string[1:length(common_chars)]]
+  }
+  
+  # Combine the common characters back into a string
+  common_prefix <- paste(common_chars, collapse = "")
+  
+   # Find the last "/" in the common prefix
+  last_slash_index <- max(gregexpr("/", common_prefix)[[1]])
+  
+  # If "/" exists, trim the prefix to stop at the last "/"
+  if (last_slash_index != -1) {
+    common_prefix <- substr(common_prefix, 1, last_slash_index)
+  }
+  
+  return(common_prefix)
+}
+
+# Function to extract stimuli from OSF
+get_stimuli <- function(dataset_id, common_prefix, save_path = ".", osf_address = "pr6wu") {
+  # Initialize the OSF node and retrieve the file list for the lab_dataset_id
+   # Attempt to retrieve files
+    file_list <- tryCatch({
+      osfr::osf_retrieve_node(osf_address) %>%
+        osfr::osf_ls_files(n_max = Inf) %>%
+        dplyr::filter(.data$name == dataset_id) %>%
+        osfr::osf_ls_files(n_max = Inf) %>%
+        dplyr::filter(.data$name == "raw_data") %>%
+        osfr::osf_ls_files(n_max = Inf)
+    }, error = function(e) {
+      message("Failed to retrieve files for dataset: ", dataset_id)
+      return(NULL)
+    })
+    
+    # Skip if file_list is NULL or empty
+    if (is.null(file_list) || nrow(file_list) == 0) {
+      message("No files found for dataset: ", dataset_id)
+      next
+    }
+    
+    print(strsplit(common_prefix, "/")[[1]])
+    # Drill down recursively for each common prefix after splitting into subparts
+    for (subpart in strsplit(common_prefix, "/")[[1]]) {
+      file_list <- tryCatch({
+        file_list %>%
+          filter(.data$name == subpart) %>%
+          osfr::osf_ls_files(n_max = Inf)
+      }, error = function(e) {
+        message("Failed to drill down for prefix part: ", subpart)
+        return(NULL)
+      })
+      
+      # Stop processing this dataset if file_list becomes NULL or empty
+      if (is.null(file_list) || nrow(file_list) == 0) {
+        message("No files found after drilling down for dataset: ", dataset_id)
+        next
+      }
+    }
+    
+    print(file_list)
+    # Download the filtered files
+    tryCatch({
+      file_list %>%
+        osfr::osf_download(path = save_path, conflicts = "overwrite", verbose = TRUE, progress = TRUE)
+    }, error = function(e) {
+      message("Failed to download files for dataset: ", dataset_id, e)
+    })
+  }
+  
+
+# Function to process each dataset
+process_datasets <- function(stimuli_cleaned, data_dir = ".", osf_address = "pr6wu") {
+  # Iterate over each unique dataset
+  unique_datasets <- unique(stimuli_cleaned$dataset_name)
+  
+  for (dataset_name in unique_datasets) {
+    # Get the common prefix for the current dataset
+    common_prefix <- stimuli_cleaned %>%
+      filter(dataset_name == !!dataset_name) %>%
+      pull(common_prefix) %>%
+      unique()
+    
+    # Define the save path for the dataset
+    dataset_folder <- file.path(data_dir, dataset_name)
+    
+    # Create the folder if it doesn't exist
+    if (!fs::dir_exists(dataset_folder)) {
+      fs::dir_create(dataset_folder)
+    }
+    
+    # Check if the folder exists and is not empty
+    if (length(fs::dir_ls(dataset_folder)) > 0) {
+      message("Skipping ", dataset_name, ": Folder exists and is not empty.")
+      next  # Skip to the next dataset if the folder is not empty
+    }
+    
+    # Call the get_stimuli function for the dataset
+    get_stimuli(
+      dataset_id = dataset_name,
+      common_prefix = common_prefix,
+      save_path = dataset_folder,
+      osf_address = osf_address
+    )
+  }
+}
+```
+
+#Downloading stimuli files
+```{r}
+stimuli_cleaned <- stimuli |>
+  filter(grepl("png", stimulus_image_path) | grepl("jpg", stimulus_image_path)) |>
+  mutate(stimulus_image_path_cleaned = gsub("^/|raw_data/", "", stimulus_image_path)) |>
+  group_by(dataset_id) |>
+   mutate(
+    # Identify the common prefix across all paths in a dataset, remove any "/" at the beginning of the common_prefix
+    common_prefix = find_common_prefix(stimulus_image_path_cleaned),
+    # Find the part of the stimulus_image_path_cleaned after removing the common_prefix
+    subfix = sub(paste0("^", common_prefix), "", stimulus_image_path_cleaned)
+  ) |> 
+  ungroup()
+
+stimuli_dataset_information <- stimuli_cleaned |>
+  group_by(dataset_id, common_prefix, dataset_name) |>
+  summarise(
+    stimuli_with_path = n(),  # Total stimuli with defined paths in this dataset
+    total_stimuli = length(stimuli$stimulus_id[stimuli$dataset_id == dataset_id]),
+    prop_with_defined_path = (stimuli_with_path / total_stimuli),  # Percentage of total stimuli
+    common_prefix = gsub("^/", "", find_common_prefix(stimulus_image_path_cleaned))  # Common prefix
+  )
+
+process_datasets(stimuli_cleaned, data_dir=here("data", "stimuli"))
+```
+
+```{r}
+DBI::dbDisconnect(conn)
+```
+
+Just plotting dataset stimuli information
+```{r}
+ggplot(stimuli_dataset_information, aes(x=prop_with_defined_path, y=stimuli_with_path, color=dataset_name)) +
+  xlab("Proportion of stimuli available") +
+  ylab("Number of stimuli available") +
+  geom_point(size = 4, alpha=0.3) 
+```
+
+Create a CSV file of all of the pairs of images in all of the trials that we have stimuli files for
+```{r}
+stimuli_trial_info <-  stimuli_cleaned |> 
+      select(stimulus_id, subfix, image_description, common_prefix)
+
+downloaded_stimuli_trials <- trial_types |>
+  filter(vanilla_trial == 1) |>
+  left_join(
+    stimuli_trial_info |> 
+      rename_with(~ paste0(.x, "_target"), everything()),
+    by = c("target_id" = "stimulus_id_target")
+  ) |>
+  left_join(
+    stimuli_trial_info |> 
+      rename_with(~ paste0(.x, "_distractor"), everything()), 
+    by = c("distractor_id" = "stimulus_id_distractor")
+  ) |>
+  filter(!is.na(subfix_distractor) & !is.na(subfix_target)) |>
+  mutate(
+    unique_pair = pmap_chr(list(target_id, distractor_id), ~ paste(sort(c(.x, .y)), collapse = "_"))
+  ) |>
+  select(subfix_distractor, unique_pair, subfix_target, dataset_name, target_id, distractor_id, image_description_target, image_description_distractor, full_phrase_language, full_phrase, trial_type_id, dataset_id)
+
+unique_stimuli_pairs <- downloaded_stimuli_trials |>
+  distinct(unique_pair, .keep_all=TRUE) |>
+  rename(text1=image_description_target, text2=image_description_distractor, image1=subfix_target, image2=subfix_distractor,image_path=dataset_name)
+
+write.csv(downloaded_stimuli_trials,file=here("peekbank_stimuli.csv"))
+```
+
+```{r}
+paste("Datasets")
+unique(downloaded_stimuli_trials$dataset_name)
+```
+
+# Processing AOIs
+```{r}
+downloaded_aois <- trials |>
+  filter(excluded == 0 & trial_type_id %in% downloaded_stimuli_trials$trial_type_id) |>
+  left_join(aoi_timepoints) |>
+  mutate(accuracy = ifelse(aoi == "target", 1, 0),
+    not_looking_away = aoi == "target" | aoi == "distractor",
+    accuracy = ifelse(not_looking_away, accuracy, NA))
+```
+
+helpers
+```{r}
+# Function to summarize whether a trial is usable based on whether the subject is looking at the screen for greater than 50% of the critical window
+summarize_subj_usable_trials <- function(data, critical_window, suffix, additional_fields=NULL) {
+  additional_fields <- additional_fields %||% list()
+  
+  data %>%
+    filter(t_norm >= critical_window[1] &
+             t_norm <= critical_window[2]) %>%
+    group_by(administration_id, trial_id, trial_type_id) %>%
+    summarize(
+      length = n(),
+      usable_frames = sum(not_looking_away, na.rm = TRUE),
+      percent_usable = usable_frames / length,
+      usable = ifelse(percent_usable >= 0.5, 1, 0), # usable if at least 50% looking
+      mean_target_looking = mean(accuracy, na.rm = TRUE),
+      !!!additional_fields,
+    ) %>%
+    rename_with(~ paste0(., "_", suffix), -c(administration_id, trial_id, trial_type_id))
+}
+
+# Function to compute whether a trial is usable based on whether both the critical window and the baseline window are usable
+compute_usable_trial <- function(baseline_col, critical_col) {
+  case_when(
+    is.na(baseline_col) ~ 0,
+    is.na(critical_col) ~ 0,
+    baseline_col == 1 & critical_col == 1 ~ 1,
+    TRUE ~ 0
+  )
+}
+
+# Calculate mean, standard deviation, standard error and confidence intervals for data grouped across two variables
+summarized_data <- function(data, x_var, y_var, group_var) {
+  return(data |>
+           group_by(across(all_of(c(x_var, group_var)))) |>
+           summarize(
+                   #across(everything(), ~ if (n_distinct(.) == 1) first(.) else NA),
+                    mean_value = mean(.data[[y_var]], na.rm = TRUE),
+                     sd_value = sd(.data[[y_var]], na.rm = TRUE),
+                     N = n(),
+                     se = sd_value / sqrt(n()),
+                     ci=qt(0.975, N-1)*sd_value/sqrt(N),
+                     lower_ci=mean_value-ci,
+                     upper_ci=mean_value+ci,
+                     .groups = 'drop') |>
+           select(where(~ !all(is.na(.))))
+  )
+}
+```
+
+```{r}
+critical_window <- c(300,3500)
+critical_window_short <- c(300,1800)
+baseline_window <- c(-2000,0)
+
+# summarize critical window
+summarize_subj_usable_trials_critical_window <- summarize_subj_usable_trials(
+  data = downloaded_aois,
+  critical_window = critical_window,
+  suffix = "critical_window"
+)
+# summarize short critical window
+summarize_subj_usable_trials_critical_window_short <- summarize_subj_usable_trials(
+  data = downloaded_aois,
+  critical_window = critical_window_short,
+  suffix = "critical_window_short"
+)
+
+# combine into one dataset
+summarize_subj_usable_trials_critical_window <- summarize_subj_usable_trials_critical_window %>%
+  left_join(summarize_subj_usable_trials_critical_window_short)
+
+# summarize baseline window information
+summarize_subj_usable_trials_baseline_window <- summarize_subj_usable_trials(
+  data = downloaded_aois,
+  critical_window = baseline_window,
+  suffix = "baseline_window")
+
+#overall usable trials
+summarize_subj_trials <- downloaded_aois %>%
+  distinct(administration_id, trial_id, trial_type_id) %>%
+  left_join(summarize_subj_usable_trials_critical_window) %>%
+  left_join(summarize_subj_usable_trials_baseline_window) %>%
+  mutate(
+    usable_window = compute_usable_trial(usable_baseline_window, usable_critical_window),
+    usable_window_short = compute_usable_trial(usable_baseline_window, usable_critical_window_short),
+    corrected_target_looking = mean_target_looking_critical_window - mean_target_looking_baseline_window,
+    corrected_target_looking_short = mean_target_looking_critical_window_short - mean_target_looking_baseline_window
+  )
+```
+### Summarize usable trials
+```{r}
+usable_trials_summarized <- summarize_subj_trials %>%
+  filter(usable_window == 1)
+```
+
+Just looking at raw trial, trial ID distributions
+```{r}
+nrow(summarize_subj_trials)
+nrow(summarize_subj_trials |> distinct(trial_type_id))
+hist(summarize_subj_trials$trial_type_id)
+
+trial_types |> filter(trial_type_id == 2696) |>
+  pull(dataset_name)
+
+fernald_dataset_trials <- trial_types |> filter(dataset_name == "fernald_marchman_2012") |>
+  left_join(trials) |> left_join(aoi_timepoints |> select(administration_id, trial_id)) |>
+  distinct(trial_id, .keep_all=TRUE)
+nrow(fernald_dataset_trials)
+nrow(fernald_dataset_trials |> distinct(administration_id))
+```
+### Overall timecourse plot of proportion target looking 
+```{r}
+# TODO: this is incorrect, takes into account NA values too when calculating SD which is why the error bars are so small
+#summarizing within subject for each time point
+summarize_subj_aois <- summarized_data(downloaded_aois, "t_norm", "accuracy", "administration_id") |> rename(mean_accuracy = mean_value)
+
+#summarizing across subjects for each time point
+summarize_across_subj_aois <- summarized_data(summarize_subj_aois, "t_norm", "mean_accuracy", "t_norm") |> rename(accuracy = mean_value)
+
+looking_times <- ggplot(summarize_across_subj_aois,aes(t_norm,accuracy))+
+  xlim(-2000,4000)+
+  geom_errorbar(aes(ymin=accuracy-ci,ymax=accuracy+ci),width=0, alpha=0.2)+
+  #geom_point(alpha=0.2)+
+    geom_smooth(method="gam")+
+  geom_vline(xintercept=0,size=1.5)+
+  geom_hline(yintercept=0.5,size=1.2,linetype="dashed")+
+  geom_vline(xintercept=300,linetype="dotted")+
+  ylim(0,1)+
+  xlab("Time (normalized to target word onset) in ms")+
+  ylab("Proportion Target Looking")
+looking_times
+ggsave(here("figures","prop_looking_across_time.png"),looking_times,width=9,height=6,bg = "white")
+```
+
+Age-related effects
+```{r}
+summarize_subjects <- summarized_data(usable_trials_summarized |> 
+                                        left_join(administrations), "administration_id", "corrected_target_looking", "age")
+ggplot(summarize_subjects, aes(x = age, y = mean_value)) +
+  geom_hline(yintercept = 0.0, linetype = "dashed") +
+  geom_point(size = 4, alpha = 0.1,
+             position = position_jitter(width = 0.1, seed = 123)) +
+  geom_smooth() +
+  scale_x_continuous(breaks = seq(5, 75, by = 10)) +
+  labs(x = "Age in months", y = "Corrected prop. of target looking by age") +
+  ggtitle("Corrected proportion of target looking by age") +
+  theme_minimal() +
+  ggpubr::stat_cor(method = "pearson")
+```
+
+CLIP similarities
+```{r}
+clip_similarities <- read.csv(here("data", "similarities-clip_data.csv")) |> filter(!is.na(image_similarity))
+
+usable_trials_summarized_with_sims <- usable_trials_summarized |>
+  left_join(clip_similarities, by = c("trial_type_id" = "stimuli_id")) |>
+  left_join(downloaded_stimuli_trials) |>
+  left_join(administrations |> select("administration_id", "age") )|>
+  group_by(unique_pair) |>
+  mutate(
+    across(
+      ends_with("similarity"),
+      ~ifelse(is.na(.), first(.[!is.na(.)]), .)
+    )
+  ) |>
+  ungroup()
+usable_trials_summarized_with_sims <- usable_trials_summarized_with_sims |> filter(!is.na(image_similarity))
+```
+CLIP helpers
+```{r}
+similarity_effect_plot <- function(data, x_var, y_var="mean_value", model_type) {
+   sim_type <- strsplit(x_var, "_")[[1]][1]
+  ggplot(data, aes(x = .data[[x_var]], y = .data[[y_var]])) +
+    geom_hline(yintercept=0,linetype="dashed")+
+    geom_point(size = 3, alpha = 0.5) +
+    geom_linerange(aes(ymin = .data[[y_var]] - ci, ymax = .data[[y_var]] + ci), width = 0.02, alpha = 0.1) + 
+    geom_smooth(method = "lm") +
+    #geom_label_repel(aes(label = paste(image_description_target, "-", image_description_distractor)), max.overlaps = 3) +
+    ylab("Baseline-corrected proportion target looking") +
+    xlab(paste(model_type,"target-distractor",sim_type,"similarity")) +
+    ggpubr::stat_cor(method = "spearman")
+}
+
+similarity_age_half_plot <- function(data, x_var, y_var="mean_value", mean_age="19.5", group_var="age_half",model_type) {
+  sim_type <- strsplit(x_var, "_")[[1]][1]
+  ggplot(data, aes(x = .data[[x_var]], y = .data[[y_var]], color = .data[[group_var]])) +
+  geom_hline(yintercept=0,linetype="dashed")+
+  geom_point(size = 3, alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  geom_linerange(aes(ymin = .data[[y_var]] - ci, ymax = .data[[y_var]] + ci), width = 0.02, alpha = 0.1) + 
+  geom_label_repel(aes(label = paste(Trials.targetImage, "-", Trials.distractorImage)), max.overlaps = 3) +
+  scale_color_brewer(palette = "Set2", name="Age half") +  # Using RColorBrewer for colors
+  ylab("Baseline-corrected proportion target looking") +
+   xlab(paste(model_type,"target-distractor",sim_type,"similarity")) +
+  ggpubr::stat_cor(method = "spearman") +
+  labs(caption=paste0("Labels are in the order of target-distractor. M=",mean_age," months"))
+}
+
+summarize_similarity_data <- function(data, extra_fields=NULL) {
+  group_vars = c("trial_type_id", "image_description_target", "image_description_distractor", "text_similarity", "image_similarity", "multimodal_similarity")
+  if (!is.null(extra_fields)) {
+    group_vars = c(group_vars, extra_fields)
+  }
+  return(summarized_data(
+      data,
+      "trial_type_id", 
+      "corrected_target_looking", 
+      group_vars
+    ))
+}
+
+generate_multimodal_plots <- function(data, model_type, suffix = "") {
+  plots <- cowplot::plot_grid(
+    similarity_effect_plot(data, paste0("text_similarity", suffix), "mean_value", model_type),
+    similarity_effect_plot(data, paste0("image_similarity", suffix), "mean_value", model_type),
+    similarity_effect_plot(data, paste0("multimodal_similarity", suffix), "mean_value", model_type),
+    nrow = 2
+  )
+  title <- cowplot_title(paste0("Target looking and semantic similarity correlations for ", model_type))
+  grid <- cowplot::plot_grid(title, plots, rel_heights = c(0.2, 1), ncol=1)
+  cowplot::save_plot(here("figures",paste0(model_type,"_similarities.png")), grid, base_width = 10, base_height = 12, bg="white")
+  grid
+}
+
+generate_multimodal_age_effect_plots <- function(data, model_type, suffix = "") {
+  plots <- cowplot::plot_grid(
+    similarity_age_half_plot(data, x_var=paste0("text_similarity", suffix), model_type=model_type),
+    similarity_age_half_plot(data, x_var=paste0("image_similarity", suffix),  model_type=model_type),
+    similarity_age_half_plot(data, x_var=paste0("multimodal_similarity", suffix), model_type=model_type),
+    nrow = 2
+  )
+  title <- cowplot_title(paste0("Target looking and semantic similarity correlations by age for ", model_type))
+  grid <- cowplot::plot_grid(title, plots, rel_heights = c(0.2, 1), ncol=1)
+  cowplot::save_plot(here("figures",paste0(model_type,"_age_similarities.png")), grid, base_width = 10, base_height = 12, bg="white")
+  grid
+}
+# To add a title to the top of a cowplot arrangement
+cowplot_title <- function(title_text) {
+  title <- ggdraw() + 
+    draw_label(
+      title_text,
+      fontface = 'bold',
+      x = 0,
+      hjust = 0
+    ) +
+    theme(
+      plot.margin = margin(0, 0, 0, 4)
+    )
+  return(title)
+}
+```
+
+CLIP analysis
+```{r}
+library(ggrepel)
+library(cowplot)
+
+clip_data_summarized <- summarize_similarity_data(usable_trials_summarized_with_sims, extra_fields = c("dataset_name")) |> filter(dataset_name == "weaver_zettersten_2024")
+#clip_data_summarized <- summarize_similarity_data(usable_trials_summarized_with_sims |> filter(14 < age & age < 24), extra_fields = c("dataset_name")) |> filter(N > 10)
+
+clip_plots <- generate_multimodal_plots(clip_data_summarized, "CLIP")
+clip_plots
+```
+
+
+```
