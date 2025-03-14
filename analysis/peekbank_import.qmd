@@ -7,6 +7,8 @@ output:
     toc: true
     toc_depth: 3
     toc_float: true
+editor_options: 
+  chunk_output_type: inline
 ---
 # Download peekbankr
 
@@ -15,8 +17,8 @@ If you haven't downloaded peekbankr (https://github.com/langcog/peekbankr) yet, 
 ```{r}
 knitr::opts_chunk$set(cache = FALSE, arn = FALSE,warning=FALSE, message = FALSE,cache.lazy = FALSE)
 
-install.packages("remotes") # can also use devtools
-remotes::install_github("langcog/peekbankr", force=TRUE)
+#install.packages("remotes") # can also use devtools
+#remotes::install_github("langcog/peekbankr", force=TRUE)
 ```
 
 # Preliminaries and data loading
@@ -24,32 +26,48 @@ remotes::install_github("langcog/peekbankr", force=TRUE)
 Load packages. Since it takes a while to download and join the data, you probably want to just do that once, and then save the resulting dataset. Setting the parameter FIRST_TIME to FALSE after you run the script the first time allows you to bypass the data download process on subsequent runs. You can also use the most recent data file uploaded to GitHub.
 
 ```{r}
-FIRST_TIME = TRUE # set to true first time to download data from DB
+FIRST_TIME = FALSE # set to true first time to download data from DB
 
 library(peekbankr)
 library(tidyverse)
 library(here)
 library(RColorBrewer)
-
-#library(cowplot)
-#theme_set(theme_cowplot())
+library(cowplot)
+theme_set(theme_cowplot())
 ```
 
-```{r, eval = FIRST_TIME}
-conn <-connect_to_peekbank("2025.1")
+```{r}
+conn <- connect_to_peekbank("2025.1")
 
 #get all of the tables you need
-datasets <- get_datasets(connection = conn) |> dplyr::collect()
-
- # ds.get_raw_data("frank_tablet_2016", "kartushina_2021")
-administrations <- get_administrations(connection = conn) |> dplyr::collect()
-subjects <- get_subjects(connection = conn) |> dplyr::collect()
-aoi_timepoints <- get_aoi_timepoints(rle=FALSE, connection = conn) |> dplyr::collect()
-stimuli <- get_stimuli() |> dplyr::collect()
-trial_types <- get_trial_types(connection = conn) |> dplyr::collect()
-trials <- get_trials(connection = conn) |> dplyr::collect()
+datasets <- peekbankr::get_datasets(connection = conn) %>% dplyr::collect()
 ```
 
+```{r}
+ # ds.get_raw_data("frank_tablet_2016", "kartushina_2021")
+administrations <- peekbankr::get_administrations(connection = conn) %>% dplyr::collect()
+subjects <- peekbankr::get_subjects(connection = conn) %>% dplyr::collect()
+aoi_timepoints <- peekbankr::get_aoi_timepoints(connection = conn) %>% dplyr::collect()
+
+# need to reconnect since aoi_timepoints takes a long time and causes our connection to drop
+conn <- connect_to_peekbank("2025.1")
+stimuli <- peekbankr::get_stimuli(connection=conn) %>% dplyr::collect()
+trial_types <- peekbankr::get_trial_types(connection = conn) %>% dplyr::collect()
+trials <- peekbankr::get_trials(connection = conn) %>% dplyr::collect()
+```
+
+```{r}
+DBI::dbDisconnect(conn)
+```
+
+dataset level subject counts - more on this in the Descriptives section
+```{r}
+subj_counts <- administrations |> left_join(subjects) |>
+  distinct(subject_id, .keep_all=TRUE) |>
+  summarize(n = n(), .by=c("dataset_name", "dataset_id"))
+```
+
+# Downloading stimuli files
 Helpers for stimuli download
 ```{r}
 # Function to find the common prefix in a vector of strings: using this to find the subdirectory that contains the image stimuli set, assuming all images are stored in or around the same subdirectory
@@ -171,7 +189,6 @@ process_datasets <- function(stimuli_cleaned, data_dir = ".", osf_address = "pr6
 }
 ```
 
-#Downloading stimuli files
 ```{r}
 stimuli_cleaned <- stimuli |>
   filter(grepl("png", stimulus_image_path) | grepl("jpg", stimulus_image_path)) |>
@@ -185,6 +202,8 @@ stimuli_cleaned <- stimuli |>
   ) |> 
   ungroup()
 
+process_datasets(stimuli_cleaned, data_dir=here("data", "stimuli"))
+
 stimuli_dataset_information <- stimuli_cleaned |>
   group_by(dataset_id, common_prefix, dataset_name) |>
   summarise(
@@ -194,11 +213,12 @@ stimuli_dataset_information <- stimuli_cleaned |>
     common_prefix = gsub("^/", "", find_common_prefix(stimulus_image_path_cleaned))  # Common prefix
   )
 
-process_datasets(stimuli_cleaned, data_dir=here("data", "stimuli"))
-```
+stimuli_dataset_information
 
-```{r}
-DBI::dbDisconnect(conn)
+
+# TODO: how to deal with updating incomplete datasets without having to re-download all stimuli? How to deal with stimuli with too many sub-paths (potter-canine) 
+# uncomment to download datasets
+# process_datasets(stimuli_cleaned, data_dir=here("data", "stimuli"))
 ```
 
 Just plotting dataset stimuli information
@@ -215,7 +235,7 @@ stimuli_trial_info <-  stimuli_cleaned |>
       select(stimulus_id, subfix, image_description, common_prefix)
 
 downloaded_stimuli_trials <- trial_types |>
-  filter(vanilla_trial == 1) |>
+  #filter(vanilla_trial == 1) |>
   left_join(
     stimuli_trial_info |> 
       rename_with(~ paste0(.x, "_target"), everything()),
@@ -230,13 +250,14 @@ downloaded_stimuli_trials <- trial_types |>
   mutate(
     unique_pair = pmap_chr(list(target_id, distractor_id), ~ paste(sort(c(.x, .y)), collapse = "_"))
   ) |>
-  select(subfix_distractor, unique_pair, subfix_target, dataset_name, target_id, distractor_id, image_description_target, image_description_distractor, full_phrase_language, full_phrase, trial_type_id, dataset_id)
+  select(subfix_distractor, unique_pair, subfix_target, dataset_name, target_id, distractor_id, image_description_target, image_description_distractor, full_phrase_language, full_phrase, trial_type_id, dataset_id, vanilla_trial)
 
+# unique pairs keep trial-distractor pairing, we only need to find similarities for the trials that we but we will probably need to do pair-wise comparisons down the line
 unique_stimuli_pairs <- downloaded_stimuli_trials |>
   distinct(unique_pair, .keep_all=TRUE) |>
   rename(text1=image_description_target, text2=image_description_distractor, image1=subfix_target, image2=subfix_distractor,image_path=dataset_name)
 
-write.csv(downloaded_stimuli_trials,file=here("peekbank_stimuli.csv"))
+write.csv(unique_stimuli_pairs,file=here("peekbank_stimuli.csv"))
 ```
 
 ```{r}
@@ -244,7 +265,7 @@ paste("Datasets")
 unique(downloaded_stimuli_trials$dataset_name)
 ```
 
-# Processing AOIs
+# Processing stimuli AOIs
 ```{r}
 downloaded_aois <- trials |>
   filter(excluded == 0 & trial_type_id %in% downloaded_stimuli_trials$trial_type_id) |>
@@ -254,6 +275,7 @@ downloaded_aois <- trials |>
     accuracy = ifelse(not_looking_away, accuracy, NA))
 ```
 
+## Summarize usable trials with stimuli
 helpers
 ```{r}
 # Function to summarize whether a trial is usable based on whether the subject is looking at the screen for greater than 50% of the critical window
@@ -304,6 +326,7 @@ summarized_data <- function(data, x_var, y_var, group_var) {
 }
 ```
 
+using same settings as visvocab
 ```{r}
 critical_window <- c(300,3500)
 critical_window_short <- c(300,1800)
@@ -344,32 +367,17 @@ summarize_subj_trials <- downloaded_aois %>%
     corrected_target_looking_short = mean_target_looking_critical_window_short - mean_target_looking_baseline_window
   )
 ```
-### Summarize usable trials
+
 ```{r}
 usable_trials_summarized <- summarize_subj_trials %>%
   filter(usable_window == 1)
 ```
 
-Just looking at raw trial, trial ID distributions
-```{r}
-nrow(summarize_subj_trials)
-nrow(summarize_subj_trials |> distinct(trial_type_id))
-hist(summarize_subj_trials$trial_type_id)
 
-trial_types |> filter(trial_type_id == 2696) |>
-  pull(dataset_name)
-
-fernald_dataset_trials <- trial_types |> filter(dataset_name == "fernald_marchman_2012") |>
-  left_join(trials) |> left_join(aoi_timepoints |> select(administration_id, trial_id)) |>
-  distinct(trial_id, .keep_all=TRUE)
-nrow(fernald_dataset_trials)
-nrow(fernald_dataset_trials |> distinct(administration_id))
-```
 ### Overall timecourse plot of proportion target looking 
 ```{r}
-# TODO: this is incorrect, takes into account NA values too when calculating SD which is why the error bars are so small
 #summarizing within subject for each time point
-summarize_subj_aois <- summarized_data(downloaded_aois, "t_norm", "accuracy", "administration_id") |> rename(mean_accuracy = mean_value)
+summarize_subj_aois <- summarized_data(downloaded_aois |> filter(!is.na(accuracy)), "t_norm", "accuracy", "administration_id") |> rename(mean_accuracy = mean_value)
 
 #summarizing across subjects for each time point
 summarize_across_subj_aois <- summarized_data(summarize_subj_aois, "t_norm", "mean_accuracy", "t_norm") |> rename(accuracy = mean_value)
@@ -405,15 +413,17 @@ ggplot(summarize_subjects, aes(x = age, y = mean_value)) +
   ggpubr::stat_cor(method = "pearson")
 ```
 
-CLIP similarities
+#Loading CLIP similarities
 ```{r}
-clip_similarities <- read.csv(here("data", "similarities-clip_data.csv")) |> filter(!is.na(image_similarity))
+# TODO: removing potter_remix stimuli for now which has incorrect image descriptions, should be fixed
+clip_similarities <- read.csv(here("data", "similarities-clip_data.csv")) |> filter(!is.na(image_similarity) & !grepl("/", word1))
 
 usable_trials_summarized_with_sims <- usable_trials_summarized |>
   left_join(clip_similarities, by = c("trial_type_id" = "stimuli_id")) |>
   left_join(downloaded_stimuli_trials) |>
   left_join(administrations |> select("administration_id", "age") )|>
   group_by(unique_pair) |>
+  # similarity scores are only generated for a single trial type ID so here we're mapping those scores to other trials that have the same image pair 
   mutate(
     across(
       ends_with("similarity"),
@@ -421,9 +431,14 @@ usable_trials_summarized_with_sims <- usable_trials_summarized |>
     )
   ) |>
   ungroup()
-usable_trials_summarized_with_sims <- usable_trials_summarized_with_sims |> filter(!is.na(image_similarity))
+
+# Filtering out trials which on the Peekbank-side allegedly had images but did not in actuality
+usable_trials_summarized_with_sims <- usable_trials_summarized_with_sims |> filter(!is.na(image_similarity) & !grepl("/", word1))
+unusable_trials <- usable_trials_summarized_with_sims |> filter(is.na(image_similarity)) |> distinct(unique_pair, .keep_all=TRUE) |> select(dataset_name, unique_pair, target_id, distractor_id, subfix_target, subfix_distractor)
 ```
-CLIP helpers
+
+
+## CLIP helpers
 ```{r}
 similarity_effect_plot <- function(data, x_var, y_var="mean_value", model_type) {
    sim_type <- strsplit(x_var, "_")[[1]][1]
@@ -431,10 +446,10 @@ similarity_effect_plot <- function(data, x_var, y_var="mean_value", model_type) 
     geom_hline(yintercept=0,linetype="dashed")+
     geom_point(size = 3, alpha = 0.5) +
     geom_linerange(aes(ymin = .data[[y_var]] - ci, ymax = .data[[y_var]] + ci), width = 0.02, alpha = 0.1) + 
-    geom_smooth(method = "lm") +
+    geom_smooth(method = "glm") +
     #geom_label_repel(aes(label = paste(image_description_target, "-", image_description_distractor)), max.overlaps = 3) +
     ylab("Baseline-corrected proportion target looking") +
-    xlab(paste(model_type,"target-distractor",sim_type,"similarity")) +
+    xlab(paste(model_type,sim_type,"similarity")) +
     ggpubr::stat_cor(method = "spearman")
 }
 
@@ -443,12 +458,12 @@ similarity_age_half_plot <- function(data, x_var, y_var="mean_value", mean_age="
   ggplot(data, aes(x = .data[[x_var]], y = .data[[y_var]], color = .data[[group_var]])) +
   geom_hline(yintercept=0,linetype="dashed")+
   geom_point(size = 3, alpha = 0.5) +
-  geom_smooth(method = "lm") +
+  geom_smooth(method = "glm") +
   geom_linerange(aes(ymin = .data[[y_var]] - ci, ymax = .data[[y_var]] + ci), width = 0.02, alpha = 0.1) + 
   geom_label_repel(aes(label = paste(Trials.targetImage, "-", Trials.distractorImage)), max.overlaps = 3) +
   scale_color_brewer(palette = "Set2", name="Age half") +  # Using RColorBrewer for colors
   ylab("Baseline-corrected proportion target looking") +
-   xlab(paste(model_type,"target-distractor",sim_type,"similarity")) +
+   xlab(paste(model_type,sim_type,"similarity")) +
   ggpubr::stat_cor(method = "spearman") +
   labs(caption=paste0("Labels are in the order of target-distractor. M=",mean_age," months"))
 }
@@ -466,14 +481,27 @@ summarize_similarity_data <- function(data, extra_fields=NULL) {
     ))
 }
 
-generate_multimodal_plots <- function(data, model_type, suffix = "") {
+summarize_similarity_data_collapsed <- function(data, extra_fields=NULL) {
+  group_vars = c("unique_pair", "image_description_target", "image_description_distractor", "text_similarity", "image_similarity", "multimodal_similarity")
+  if (!is.null(extra_fields)) {
+    group_vars = c(group_vars, extra_fields)
+  }
+  return(summarized_data(
+      data,
+      "unique_pair", 
+      "corrected_target_looking", 
+      group_vars
+    ))
+}
+
+generate_multimodal_plots <- function(data, model_type, suffix = "", title="") {
   plots <- cowplot::plot_grid(
     similarity_effect_plot(data, paste0("text_similarity", suffix), "mean_value", model_type),
     similarity_effect_plot(data, paste0("image_similarity", suffix), "mean_value", model_type),
     similarity_effect_plot(data, paste0("multimodal_similarity", suffix), "mean_value", model_type),
     nrow = 2
   )
-  title <- cowplot_title(paste0("Target looking and semantic similarity correlations for ", model_type))
+  title <- cowplot_title(paste0("Target looking and target-distractor similarity correlations for ", title))
   grid <- cowplot::plot_grid(title, plots, rel_heights = c(0.2, 1), ncol=1)
   cowplot::save_plot(here("figures",paste0(model_type,"_similarities.png")), grid, base_width = 10, base_height = 12, bg="white")
   grid
@@ -491,6 +519,7 @@ generate_multimodal_age_effect_plots <- function(data, model_type, suffix = "") 
   cowplot::save_plot(here("figures",paste0(model_type,"_age_similarities.png")), grid, base_width = 10, base_height = 12, bg="white")
   grid
 }
+
 # To add a title to the top of a cowplot arrangement
 cowplot_title <- function(title_text) {
   title <- ggdraw() + 
@@ -507,17 +536,150 @@ cowplot_title <- function(title_text) {
 }
 ```
 
-CLIP analysis
+
+## CLIP analysis
+CLIP analysis: current similarity effects are dubious with lots of dataset level variance of course that will have to be accounted for in a mixed effects model; Garrison Bergelson dataset has individualized trials so difficult to make use of 
 ```{r}
 library(ggrepel)
 library(cowplot)
 
-clip_data_summarized <- summarize_similarity_data(usable_trials_summarized_with_sims, extra_fields = c("dataset_name")) |> filter(dataset_name == "weaver_zettersten_2024")
-#clip_data_summarized <- summarize_similarity_data(usable_trials_summarized_with_sims |> filter(14 < age & age < 24), extra_fields = c("dataset_name")) |> filter(N > 10)
-
+clip_data_summarized <- summarize_similarity_data_collapsed(usable_trials_summarized_with_sims, extra_fields = c("dataset_name", "vanilla_trial")) 
 clip_plots <- generate_multimodal_plots(clip_data_summarized, "CLIP")
 clip_plots
+
+# N = the number of participants in a single trial here
+adams_marchman_data_summarized <- summarize_similarity_data_collapsed(usable_trials_summarized_with_sims, extra_fields = c("dataset_name", "vanilla_trial")) |> filter(N > 50 & dataset_name == "adams_marchman_2018" & vanilla_trial==1)
+am_plots <- generate_multimodal_plots(adams_marchman_data_summarized, "CLIP", title="Adams & Marchman, 2018")
+am_plots
+
+ weaver_zettersten_data_summarized <- summarize_similarity_data_collapsed(usable_trials_summarized_with_sims, extra_fields = c("dataset_name", "vanilla_trial")) |> filter(N > 50 & dataset_name == "weaver_zettersten_2024" & vanilla_trial==1)
+wz_plots <- generate_multimodal_plots(weaver_zettersten_data_summarized, "CLIP")
+wz_plots
 ```
 
+## Descriptives
+### Image pairs
+```{r}
+clip_stacked_bar <- clip_data_summarized |>
+  #filter(N > 10) |>
+  group_by(dataset_name) |>
+  summarize(trial_count = n(), vanilla_count = sum(vanilla_trial == 1), non_vanilla_count = sum(vanilla_trial != 1), .groups = "drop") |>
+  pivot_longer(cols = c(vanilla_count, non_vanilla_count), 
+               names_to = "trial_type", 
+               values_to = "count")
 
+# Create stacked bar chart
+ggplot(clip_stacked_bar, aes(x = dataset_name, y = count, fill = trial_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Number of unique target-distractor pairs",
+       x = "Dataset Name", 
+       y = "Count", 
+       fill = "Trial Type") +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Raw trial counts
+```{r}
+# Function to calculate Pearson's correlation per epoch
+round_to_nearest <- function(x, round_to=3) {
+  round(x / round_to) * round_to
+}
+
+# rounding each participant to the closest 5
+age_based_trials <- usable_trials_summarized_with_sims |> mutate(
+  rounded_age = round_to_nearest(age, round_to=5)
+)
+
+clip_age_stacked_bar <- age_based_trials |>
+  #filter(N > 10) |>
+  group_by(rounded_age, dataset_name) |>
+  summarize(trial_count = n(), .groups = "drop")
+
+ggplot(clip_age_stacked_bar, aes(x = factor(rounded_age), y = trial_count, fill = dataset_name)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Number of Trials by Dataset and Age",
+    x = "Age in months (rounded to nearest 5 month)",
+    y = "Number of Trials",
+    fill = "Dataset"
+  ) +
+  theme_minimal()
+```
+### Raw participant counts
+```{r}
+trials_with_subject_info <- usable_trials_summarized_with_sims |> left_join(administrations |> select(administration_id, subject_id)) |>
+  left_join(subjects |> select(subject_id, subject_aux_data)) 
+
+subject_counts <- trials_with_subject_info |>
+  mutate(has_cdi = grepl("cdi", subject_aux_data)) |>
+  summarize(trial_count = n(), .by=c(has_cdi, subject_id, dataset_name))
+
+dataset_subject_counts <- subject_counts |>
+  summarize(subject_count = n(), average_trial_count = mean(trial_count), cdi_count = sum(has_cdi == TRUE), non_cdi_count = (sum(has_cdi == FALSE)), .by=dataset_name)  |>
+  pivot_longer(cols = c(cdi_count, non_cdi_count), 
+               names_to = "cdi", 
+               values_to = "count")
+
+# Create stacked bar chart
+ggplot(dataset_subject_counts, aes(x = paste0(dataset_name,"(subj trials M=", round(average_trial_count, 1), ")"), y = count, fill = cdi)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Number of participants",
+       x = "Dataset Name", 
+       y = "Count", 
+       fill = "Has CDI") +
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## Analysis across age
+```{r}
+calculate_correlations <- function(data, x_var, y_var, group_var = c("rounded_age"), conf_level = 0.95) {
+  data |>
+    group_by(across(all_of(group_var))) |>
+    summarize(
+      {
+        cor_test <- cor.test(.data[[x_var]], .data[[y_var]], method = "pearson", conf.level = conf_level)
+        tibble(
+          pearson_cor = cor_test$estimate,
+          p_value = cor_test$p.value,
+          ci_lower = cor_test$conf.int[1],
+          ci_upper = cor_test$conf.int[2]
+        )
+      },
+      .groups = "drop"
+    )
+}
+
+sim_age_plot <- function(data) {
+  ggplot(data, aes(x = rounded_age, y = pearson_cor, color = similarity_type)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_point(size = 3, position = position_dodge(width=0.5)) +  # Apply jitter to points only
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                  width = 0.3, alpha = 0.5,
+                  position=position_dodge(width=0.5)) +  # No jitter on error bars
+    geom_smooth(span = 2, alpha=0.4, se=FALSE) +
+    labs(title = paste("Similarity correlations across age"),
+         x = "Age",
+         y = "Coefficient of similarity") +  
+    theme_minimal() +
+    guides(shape = "none") +
+    scale_color_brewer(palette = "Set1", name = "Similarity type") 
+}
+
+clip_data_age_summarized <- summarize_similarity_data_collapsed(age_based_trials, extra_fields = c("rounded_age", "dataset_name")) |> filter(N > 10)
+clip_age_image_cors <- calculate_correlations(clip_data_age_summarized, "image_similarity", "mean_value") |> mutate(similarity_type = "image")
+clip_age_text_cors <- calculate_correlations(clip_data_age_summarized, "text_similarity", "mean_value") |> mutate(similarity_type = "text")
+clip_age_cors <- bind_rows(clip_age_image_cors, clip_age_text_cors)
+sim_age_plot(clip_age_cors)
+
+ggplot(clip_age_cors, aes(x = rounded_age, y = pearson_cor)) +
+  geom_point(aes(color = p_value < 0.05), size = 3) + 
+  geom_smooth(span = 2) +
+  labs(title = "Image similarity correlation across age",
+       x = "Age in months",
+       y = "Pearson Correlation") +
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = "gray")) +  # Set color for significance
+  theme_minimal() +
+  theme(legend.position = "none")
 ```
